@@ -4,10 +4,15 @@ import shutil
 import subprocess
 import sys
 from glob import glob
+from typing import Any, Dict, List
 
-from conda_smithy.linter import rattler_linter
+from conda_smithy.linter import conda_recipe_v1_linter
 from conda_smithy.linter.errors import HINT_NO_ARCH
-from conda_smithy.linter.utils import find_local_config_file, is_selector_line
+from conda_smithy.linter.utils import (
+    VALID_PYTHON_BUILD_BACKENDS,
+    find_local_config_file,
+    is_selector_line,
+)
 from conda_smithy.utils import get_yaml
 
 
@@ -24,6 +29,25 @@ def hint_pip_usage(build_section, hints):
                 )
 
 
+def hint_sources_should_not_mention_pypi_io_but_pypi_org(
+    sources_section: List[Dict[str, Any]], hints: List[str]
+):
+    """
+    Grayskull and conda-forge default recipe used to have pypi.io as a default,
+    but cannonical url is PyPI.org.
+
+    See https://github.com/conda-forge/staged-recipes/pull/27946
+    """
+    for source_section in sources_section:
+        source = source_section.get("url", "") or ""
+        sources = [source] if isinstance(source, str) else source
+        if any(s.startswith("https://pypi.io/") for s in sources):
+            hints.append(
+                "PyPI default URL is now pypi.org, and not pypi.io."
+                " You may want to update the default source url."
+            )
+
+
 def hint_suggest_noarch(
     noarch_value,
     build_reqs,
@@ -32,7 +56,7 @@ def hint_suggest_noarch(
     conda_forge,
     recipe_fname,
     hints,
-    is_rattler_build: bool = False,
+    recipe_version: int = 0,
 ):
     if (
         noarch_value is None
@@ -41,8 +65,8 @@ def hint_suggest_noarch(
         and ("pip" in build_reqs)
         and (is_staged_recipes or not conda_forge)
     ):
-        if is_rattler_build:
-            rattler_linter.hint_noarch_usage(
+        if recipe_version == 1:
+            conda_recipe_v1_linter.hint_noarch_usage(
                 build_reqs, raw_requirements_section, hints
             )
         else:
@@ -174,3 +198,111 @@ def hint_check_spdx(about_section, hints):
             "Documentation on acceptable licenses can be found "
             "[here]( https://conda-forge.org/docs/maintainer/adding_pkgs.html#spdx-identifiers-and-expressions )."
         )
+
+
+def hint_pip_no_build_backend(host_or_build_section, package_name, hints):
+    # we do NOT exclude all build backends since some of them
+    # need another backend to bootstrap
+    # the list below are the ones that self-bootstrap without
+    # another build backend
+    if package_name in ["pdm-backend", "setuptools"]:
+        return
+
+    if host_or_build_section and any(
+        req.split(" ")[0] == "pip" for req in host_or_build_section
+    ):
+        found_backend = False
+        for backend in VALID_PYTHON_BUILD_BACKENDS:
+            if any(
+                req.split(" ")[0]
+                in [
+                    backend,
+                    backend.replace("-", "_"),
+                    backend.replace("_", "-"),
+                ]
+                for req in host_or_build_section
+            ):
+                found_backend = True
+                break
+
+        if not found_backend:
+            hints.append(
+                f"No valid build backend found for Python recipe for package `{package_name}` using `pip`. "
+                "Python recipes using `pip` need to "
+                "explicitly specify a build backend in the `host` section. "
+                "If your recipe has built with only `pip` in the `host` section in the past, you likely should "
+                "add `setuptools` to the `host` section of your recipe."
+            )
+
+
+def hint_noarch_python_use_python_min(
+    host_reqs,
+    run_reqs,
+    test_reqs,
+    outputs_section,
+    noarch_value,
+    recipe_version,
+    hints,
+):
+    if noarch_value == "python" and not outputs_section:
+        hint = ""
+        for section_name, syntax, report_syntax, reqs in [
+            (
+                "host",
+                r"python\s+{{ python_min }}",
+                "python {{ python_min }}",
+                host_reqs,
+            ),
+            (
+                "run",
+                r"python\s+>={{ python_min }}",
+                "python >={{ python_min }}",
+                run_reqs,
+            ),
+            (
+                "test.requires",
+                r"python\s+{{ python_min }}",
+                "python {{ python_min }}",
+                test_reqs,
+            ),
+        ]:
+            if recipe_version == 1:
+                syntax = syntax.replace(
+                    "{{ python_min }}", "${{ python_min }}"
+                )
+                report_syntax = report_syntax.replace(
+                    "{{ python_min }}", "${{ python_min }}"
+                )
+                test_syntax = syntax
+            else:
+                test_syntax = syntax.replace("{{ python_min }}", "9999")
+
+            for req in reqs:
+                if (
+                    req.strip().split()[0] == "python"
+                    and req != "python"
+                    and re.search(test_syntax, req)
+                ):
+                    break
+            else:
+                hint += (
+                    f"\n   - For the `{section_name}` section of the recipe, you should usually use `{report_syntax}` "
+                    f"for the `python` entry."
+                )
+
+        if hint:
+            hint = (
+                (
+                    "`noarch: python` recipes should usually follow the syntax in "
+                    "our [documentation](https://conda-forge.org/docs/maintainer/knowledge_base/#noarch-python) "
+                    "for specifying the Python version."
+                )
+                + hint
+                + (
+                    "\n   - If the package requires a newer Python version than the currently supported minimum "
+                    "version on `conda-forge`, you can override the `python_min` variable by adding a "
+                    "Jinja2 `set` statement at the top of your recipe (or using an equivalent `context` "
+                    "variable for v1 recipes)."
+                )
+            )
+            hints.append(hint)

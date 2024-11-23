@@ -4,30 +4,30 @@ Authors are sorted by number of commits.
 * Isuru Fernando
 * Matthew R. Becker
 * Jaime Rodríguez-Guerra
+* nichmor
 * Christopher J. Wright
 * Anthony Scopatz
 * Phil Elson
-* nichmor
 * H. Vetinari
+* Wolf Vollprecht
 * Uwe L. Korn
 * Filipe Fernandes
 * Dougal J. Sutherland
-* Amit Kumar
 * Min RK
+* Amit Kumar
 * Marcel Bargull
-* shadow_walker
-* Michael Sarahan
 * John Kirkham
-* Bastian Zimmermann
-* Mark Harfouche
-* Leo Fang
+* shadow_walker
 * Hadrien Mary
+* Michael Sarahan
+* pre-commit-ci[bot]
+* Mark Harfouche
+* Bastian Zimmermann
+* Leo Fang
 * Ryan Volz
 * Johnny Willemsen
-* pre-commit-ci[bot]
 * Chris Burr
 * Julian Rüth
-* Wolf Vollprecht
 * Yannik Tausch
 * Daniel Bast
 * Billy K. Poon
@@ -38,8 +38,8 @@ Authors are sorted by number of commits.
 * Eric Dill
 * Natasha Pavlovikj
 * Maksim Rakitin
-* Jan Schulz
 * Nicholas Bollweg
+* Jan Schulz
 * Josh Reichardt
 * Bela Stoyan
 * Justin Calamari
@@ -49,6 +49,7 @@ Authors are sorted by number of commits.
 * C.A.M. Gerlach
 * refraction-ray
 * Leopold Talirz
+* Peter Williams
 * Tom Pollard
 * Gonzalo Pena-Castellanos
 * John Blischak
@@ -56,19 +57,21 @@ Authors are sorted by number of commits.
 * Antonio S. Cofiño
 * Carlo
 * Matthew Craig
-* Peter Williams
 * Joshua L. Adelman
 * Marius van Niekerk
 * Johannes Köster
 * Philippe Blain
 * Mervin Fansler
+* dependabot[bot]
 * Matt McCormick
 * Jan Janßen
 * xoviat
 * Elmar Pruesse
 * Patrick Sodré
+* Ben Mares
 * David Hirschfeld
 * Finn Womack
+* M Bussonnier
 * Josh Barnes
 * Tobias Megies
 * Jonathan Helmus
@@ -93,11 +96,12 @@ Authors are sorted by number of commits.
 * Thomas Hopkins
 * Hugo Slepicka
 * fhoehle
-* Ben Mares
 * Matthew W. Thompson
+* Nehal J Wani
 * conda-forge-admin
 * Klaus Zimmermann
-* dependabot[bot]
+* Dominic Davis-Foster
+* Anton Tetov
 * lorenz
 * Tom Augspurger
 * Ryan May
@@ -118,8 +122,8 @@ Authors are sorted by number of commits.
 * Nils Wentzell
 * Stuart Berg
 * Mike Taves
-* Nehal J Wani
 * Benjamin Tovar
 * Sylvain Corlay
 * Brandon Andersen
 * Vincenzo Eduardo Padulano
+* Bas Zalmstra

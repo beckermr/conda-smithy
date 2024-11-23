@@ -16,7 +16,7 @@
 
 **Fixed:**
 
-* Add upper bound for rattler-build-conda-compat. (#2009)
+* Fixed a bug that caused the linter to fail when a v1 recipe had the `ignore_run_exports` key. (#2157, #2153)
 
 **Security:**
 

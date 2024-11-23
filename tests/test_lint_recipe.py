@@ -5,21 +5,36 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
-import warnings
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 
-import github
 import pytest
 
 import conda_smithy.lint_recipe as linter
+from conda_smithy.linter.utils import VALID_PYTHON_BUILD_BACKENDS
+from conda_smithy.utils import get_yaml, render_meta_yaml
 
 _thisdir = os.path.abspath(os.path.dirname(__file__))
 
 
-def is_gh_token_set():
-    return "GH_TOKEN" in os.environ
+@contextmanager
+def get_recipe_in_dir(recipe_name: str) -> Path:
+    base_dir = Path(__file__).parent
+    recipe_path = base_dir / "recipes" / recipe_name
+    assert recipe_path.exists(), f"Recipe {recipe_name} does not exist"
+
+    # create a temporary directory to copy the recipe into
+    with tmp_directory() as tmp_dir:
+        # copy the file into the temporary directory
+        recipe_folder = Path(tmp_dir) / "recipe"
+        recipe_folder.mkdir()
+        shutil.copy(recipe_path, recipe_folder / "recipe.yaml")
+
+        try:
+            yield recipe_folder
+        finally:
+            pass
 
 
 @contextmanager
@@ -53,11 +68,32 @@ def test_stdlib_lint(comp_lang):
         assert any(lint.startswith(expected_message) for lint in lints)
 
 
+def test_m2w64_stdlib_legal():
+    # allow recipes that _only_ depend on {{ stdlib("m2w64_c") }}
+    avoid_message = "stdlib"
+
+    with tmp_directory() as recipe_dir:
+        with open(os.path.join(recipe_dir, "meta.yaml"), "w") as fh:
+            fh.write(
+                """
+                package:
+                   name: foo
+                requirements:
+                  build:
+                    - {{ stdlib("m2w64_c") }}
+                    - {{ compiler("m2w64_c") }}
+                """
+            )
+
+        lints, _ = linter.main(recipe_dir, return_hints=True)
+        assert not any(avoid_message in lint for lint in lints)
+
+
 @pytest.mark.parametrize(
     "comp_lang",
     ["c", "cxx", "fortran", "rust", "m2w64_c", "m2w64_cxx", "m2w64_fortran"],
 )
-def test_rattler_stdlib_hint(comp_lang):
+def test_v1_stdlib_hint(comp_lang):
     expected_message = "This recipe is using a compiler"
 
     with tmp_directory() as recipe_dir:
@@ -188,7 +224,7 @@ def test_osx_noarch_hint(where):
         assert not any(h.startswith(avoid_message) for h in hints)
 
 
-def test_rattler_osx_noarch_hint():
+def test_recipe_v1_osx_noarch_hint():
     # don't warn on packages that are using __osx as a noarch-marker, see
     # https://conda-forge.org/docs/maintainer/knowledge_base/#noarch-packages-with-os-specific-dependencies
     avoid_message = "You're setting a constraint on the `__osx` virtual"
@@ -324,8 +360,8 @@ MACOSX_SDK_VERSION:         # [osx]
             assert any(lint.startswith(exp_lint) for lint in lints)
 
 
-@pytest.mark.parametrize("is_rattler_build,", [(False,), (True,)])
-def test_license_file_required(is_rattler_build):
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_license_file_required(recipe_version: int):
     meta = {
         "about": {
             "home": "a URL",
@@ -334,14 +370,14 @@ def test_license_file_required(is_rattler_build):
         }
     }
     lints, hints = linter.lintify_meta_yaml(
-        meta, is_rattler_build=is_rattler_build
+        meta, recipe_version=recipe_version
     )
     expected_message = "license_file entry is missing, but is required."
     assert expected_message in lints
 
 
-@pytest.mark.parametrize("is_rattler_build,", [(False,), (True,)])
-def test_license_file_empty(is_rattler_build):
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_license_file_empty(recipe_version: int):
     meta = {
         "about": {
             "home": "a URL",
@@ -352,7 +388,7 @@ def test_license_file_empty(is_rattler_build):
         }
     }
     lints, hints = linter.lintify_meta_yaml(
-        meta, is_rattler_build=is_rattler_build
+        meta, recipe_version=recipe_version
     )
     expected_message = "license_file entry is missing, but is required."
     assert expected_message in lints
@@ -409,7 +445,7 @@ def test_license_file_empty(is_rattler_build):
         (None, None, ["10.12", "11.0"], "You are"),
     ],
 )
-def test_rattler_cbc_osx_hints(
+def test_v1_cbc_osx_hints(
     std_selector, with_linux, reverse_arch, macdt, v_std, sdk, exp_lint
 ):
     with tmp_directory() as recipe_dir:
@@ -518,9 +554,9 @@ class TestLinter(unittest.TestCase):
         expected_msg = "The top level meta key sources is unexpected"
         self.assertIn(expected_msg, lints)
 
-    def test_rattler_bad_top_level(self):
+    def test_recipe_v1_bad_top_level(self):
         meta = OrderedDict([["package", {}], ["build", {}], ["sources", {}]])
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         expected_msg = "The top level meta key sources is unexpected"
         self.assertIn(expected_msg, lints)
 
@@ -575,7 +611,7 @@ class TestLinter(unittest.TestCase):
 
     def test_missing_about_homepage_empty(self):
         meta = {"about": {"homepage": "", "summary": "", "license": ""}}
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         expected_message = (
             "The homepage item is expected in the about section."
         )
@@ -691,25 +727,32 @@ class TestLinter(unittest.TestCase):
             "It looks like the 'foobar' output doesn't have any tests.", hints
         )
 
-    def test_rattler_test_section(self):
+    def test_recipe_v1_test_section(self):
         expected_message = "The recipe must have some tests."
 
-        lints, hints = linter.lintify_meta_yaml({}, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml({}, recipe_version=1)
         self.assertIn(expected_message, lints)
 
         lints, hints = linter.lintify_meta_yaml(
-            {"tests": {"script": "sys"}}, is_rattler_build=True
+            {"tests": [{"script": "sys"}]}, recipe_version=1
         )
         self.assertNotIn(expected_message, lints)
 
         lints, hints = linter.lintify_meta_yaml(
-            {"outputs": [{"name": "foo"}]}, is_rattler_build=True
+            {"outputs": [{"name": "foo"}]}, recipe_version=1
         )
         self.assertIn(expected_message, lints)
 
         lints, hints = linter.lintify_meta_yaml(
-            {"outputs": [{"name": "foo", "tests": {"python": "sys"}}]},
-            is_rattler_build=True,
+            {
+                "outputs": [
+                    {
+                        "name": "foo",
+                        "tests": [{"python": {"imports": ["sys"]}}],
+                    }
+                ]
+            },
+            recipe_version=1,
         )
         self.assertNotIn(expected_message, lints)
 
@@ -722,7 +765,7 @@ class TestLinter(unittest.TestCase):
                     },
                 ]
             },
-            is_rattler_build=True,
+            recipe_version=1,
         )
         self.assertNotIn(expected_message, lints)
         self.assertIn(
@@ -744,23 +787,22 @@ class TestLinter(unittest.TestCase):
             lints, hints = linter.lintify_meta_yaml({}, recipe_dir)
             self.assertNotIn(expected_message, lints)
 
-    def test_rattler_test_section_with_recipe(self):
-        # rattler-build support legacy run_test.py, so we need to test it
-
+    def test_recipe_v1_test_section_with_recipe(self):
         expected_message = "The recipe must have some tests."
 
         with tmp_directory() as recipe_dir:
             lints, hints = linter.lintify_meta_yaml(
-                {}, recipe_dir, is_rattler_build=True
+                {}, recipe_dir, recipe_version=1
             )
             self.assertIn(expected_message, lints)
 
+            # Note: v1 recipes have no implicit "run_test.py" support
             with open(os.path.join(recipe_dir, "run_test.py"), "w") as fh:
                 fh.write("# foo")
             lints, hints = linter.lintify_meta_yaml(
-                {}, recipe_dir, is_rattler_build=True
+                {}, recipe_dir, recipe_version=1
             )
-            self.assertNotIn(expected_message, lints)
+            self.assertIn(expected_message, lints)
 
     def test_jinja2_vars(self):
         expected_message = (
@@ -791,7 +833,7 @@ class TestLinter(unittest.TestCase):
             _, hints = linter.lintify_meta_yaml({}, recipe_dir)
             self.assertTrue(any(h.startswith(expected_message) for h in hints))
 
-    def test_rattler_jinja2_vars(self):
+    def test_recipe_v1_jinja2_vars(self):
         expected_message = (
             "Jinja2 variable references are suggested to take a ``${{<one space>"
             "<variable name><one space>}}`` form. See lines %s."
@@ -818,7 +860,7 @@ class TestLinter(unittest.TestCase):
                 )
 
             _, hints = linter.lintify_meta_yaml(
-                {}, recipe_dir, is_rattler_build=True
+                {}, recipe_dir, recipe_version=1
             )
             self.assertTrue(any(h.startswith(expected_message) for h in hints))
 
@@ -977,10 +1019,24 @@ class TestLinter(unittest.TestCase):
 
         with tmp_directory() as recipe_dir:
 
-            def assert_noarch_selector(meta_string, is_good=False):
+            def assert_noarch_selector(meta_string, is_good=False, skip=False):
                 with open(os.path.join(recipe_dir, "meta.yaml"), "w") as fh:
                     fh.write(meta_string)
+                if skip:
+                    with open(
+                        os.path.join(recipe_dir, "conda-forge.yml"), "w"
+                    ) as fh:
+                        fh.write(
+                            """
+linter:
+  skip:
+    - lint_noarch_selectors
+"""
+                        )
                 lints = linter.main(recipe_dir)
+                if skip:
+                    os.remove(os.path.join(recipe_dir, "conda-forge.yml"))
+
                 if is_good:
                     message = (
                         "Found lints when there shouldn't have "
@@ -1010,6 +1066,15 @@ class TestLinter(unittest.TestCase):
                               noarch: generic
                               skip: true  # [win]
                             """
+            )
+            assert_noarch_selector(
+                """
+                            build:
+                              noarch: generic
+                              skip: true  # [win]
+                            """,
+                is_good=True,
+                skip=True,
             )
             assert_noarch_selector(
                 """
@@ -1121,13 +1186,16 @@ class TestLinter(unittest.TestCase):
                             """
             )
 
-    def test_rattler_noarch_selectors(self):
+    def test_recipe_v1_noarch_selectors(self):
         expected_start = "`noarch` packages can't have"
 
         with tmp_directory() as recipe_dir:
 
             def assert_noarch_selector(
-                meta_string, is_good=False, has_noarch=False
+                meta_string,
+                is_good=False,
+                has_noarch=False,
+                skip=False,
             ):
                 with open(os.path.join(recipe_dir, "recipe.yaml"), "w") as fh:
                     fh.write(meta_string)
@@ -1144,8 +1212,17 @@ noarch_platforms:
   - linux_64
 """
                         )
+                    if skip:
+                        fh.write(
+                            """
+linter:
+  skip:
+    - lint_noarch_selectors
+"""
+                        )
 
                 lints = linter.main(recipe_dir, feedstock_dir=recipe_dir)
+                os.remove(os.path.join(recipe_dir, "conda-forge.yml"))
                 if is_good:
                     message = (
                         "Found lints when there shouldn't have "
@@ -1169,6 +1246,16 @@ noarch_platforms:
                               skip:
                                 - win
                 """
+            )
+            assert_noarch_selector(
+                """
+                            build:
+                              noarch: python
+                              skip:
+                                - win
+                """,
+                is_good=True,
+                skip=True,
             )
             assert_noarch_selector(
                 """
@@ -1306,7 +1393,7 @@ noarch_platforms:
                 is_good=True,
             )
 
-    def test_suggest_rattler_noarch(self):
+    def test_suggest_v1_noarch(self):
         expected_start = "Whenever possible python packages should use noarch."
         with tmp_directory() as recipe_dir:
 
@@ -1688,9 +1775,9 @@ noarch_platforms:
         )
         self.assertIn(expected_message, lints)
 
-    def test_rattler_recipe_name(self):
+    def test_recipe_v1_recipe_name(self):
         meta = {"package": {"name": "mp++"}}
-        lints, _ = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
         expected_message = (
             "Recipe name has invalid characters. only lowercase alpha, "
             "numeric, underscores, hyphens and dots allowed"
@@ -1702,7 +1789,7 @@ noarch_platforms:
             "package": {"name": "${{ blah }}"},
         }  # noqa
         lints, _ = linter.lintify_meta_yaml(
-            meta_with_context, is_rattler_build=True
+            meta_with_context, recipe_version=1
         )
         expected_message = (
             "Recipe name has invalid characters. only lowercase alpha, "
@@ -1712,7 +1799,7 @@ noarch_platforms:
 
         meta_with_context = {"recipe": {"name": "mp++"}, "outputs": []}  # noqa
         lints, _ = linter.lintify_meta_yaml(
-            meta_with_context, is_rattler_build=True
+            meta_with_context, recipe_version=1
         )
         expected_message = (
             "Recipe name has invalid characters. only lowercase alpha, "
@@ -1771,7 +1858,6 @@ noarch_platforms:
         )
         assert not lints
 
-    @unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
     def test_maintainer_exists(self):
         lints, _ = linter.lintify_meta_yaml(
             {"extra": {"recipe-maintainers": ["support"]}}, conda_forge=True
@@ -1785,167 +1871,28 @@ noarch_platforms:
         expected_message = 'Recipe maintainer "isuruf" does not exist'
         self.assertNotIn(expected_message, lints)
 
-        expected_message = (
-            "Feedstock with the same name exists in conda-forge."
-        )
-        # Check that feedstock exists if staged_recipes
+    def test_maintainer_team_exists(self):
         lints, _ = linter.lintify_meta_yaml(
-            {"package": {"name": "python"}},
-            recipe_dir="python",
-            conda_forge=True,
-        )
-        self.assertIn(expected_message, lints)
-        lints, _ = linter.lintify_meta_yaml(
-            {"package": {"name": "python"}},
-            recipe_dir="python",
-            conda_forge=False,
-        )
-        self.assertNotIn(expected_message, lints)
-        # No lint if in a feedstock
-        lints, _ = linter.lintify_meta_yaml(
-            {"package": {"name": "python"}},
-            recipe_dir="recipe",
-            conda_forge=True,
-        )
-        self.assertNotIn(expected_message, lints)
-        lints, _ = linter.lintify_meta_yaml(
-            {"package": {"name": "python"}},
-            recipe_dir="recipe",
-            conda_forge=False,
-        )
-        self.assertNotIn(expected_message, lints)
-
-        # Make sure there's no feedstock named python1 before proceeding
-        gh = github.Github(os.environ["GH_TOKEN"])
-        cf = gh.get_user("conda-forge")
-        try:
-            cf.get_repo("python1-feedstock")
-            feedstock_exists = True
-        except github.UnknownObjectException:
-            feedstock_exists = False
-
-        if feedstock_exists:
-            warnings.warn(
-                "There's a feedstock named python1, but tests assume that there isn't"
-            )
-        else:
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": "python1"}},
-                recipe_dir="python",
-                conda_forge=True,
-            )
-            self.assertNotIn(expected_message, lints)
-
-        # Test bioconda recipe checking
-        expected_message = (
-            "Recipe with the same name exists in bioconda: "
-            "please discuss with @conda-forge/bioconda-recipes."
-        )
-        bio = gh.get_user("bioconda").get_repo("bioconda-recipes")
-        r = "samtools"
-        try:
-            bio.get_dir_contents(f"recipe/{r}")
-        except github.UnknownObjectException:
-            warnings.warn(
-                f"There's no bioconda recipe named {r}, but tests assume that there is"
-            )
-        else:
-            # Check that feedstock exists if staged_recipes
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": r}}, recipe_dir=r, conda_forge=True
-            )
-            self.assertIn(expected_message, lints)
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": r}}, recipe_dir=r, conda_forge=False
-            )
-            self.assertNotIn(expected_message, lints)
-            # No lint if in a feedstock
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": r}}, recipe_dir="recipe", conda_forge=True
-            )
-            self.assertNotIn(expected_message, lints)
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": r}},
-                recipe_dir="recipe",
-                conda_forge=False,
-            )
-            self.assertNotIn(expected_message, lints)
-            # No lint if the name isn't specified
-            lints, _ = linter.lintify_meta_yaml(
-                {}, recipe_dir=r, conda_forge=True
-            )
-            self.assertNotIn(expected_message, lints)
-
-        r = "this-will-never-exist"
-        try:
-            bio.get_dir_contents(f"recipes/{r}")
-        except github.UnknownObjectException:
-            lints, _ = linter.lintify_meta_yaml(
-                {"package": {"name": r}}, recipe_dir=r, conda_forge=True
-            )
-            self.assertNotIn(expected_message, lints)
-        else:
-            warnings.warn(
-                f"There's a bioconda recipe named {r}, but tests assume that there isn't"
-            )
-
-        expected_message = (
-            "A conda package with same name (numpy) already exists."
-        )
-        lints, hints = linter.lintify_meta_yaml(
             {
-                "package": {"name": "this-will-never-exist"},
-                "source": {
-                    "url": "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz"
-                },
-            },
-            recipe_dir="recipes/foo",
-            conda_forge=True,
-        )
-        self.assertIn(expected_message, hints)
-
-        # check that this doesn't choke
-        lints, hints = linter.lintify_meta_yaml(
-            {
-                "package": {"name": "this-will-never-exist"},
-                "source": {
-                    "url": [
-                        "https://pypi.io/packages/source/n/numpy/numpy-1.26.4.tar.gz"
+                "extra": {
+                    "recipe-maintainers": [
+                        "conda-forge/blahblahblah-foobarblah"
                     ]
-                },
+                }
             },
-            recipe_dir="recipes/foo",
             conda_forge=True,
         )
+        expected_message = 'Recipe maintainer team "conda-forge/blahblahblah-foobarblah" does not exist'
+        self.assertIn(expected_message, lints)
 
-    @unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
-    def test_maintainer_participation(self):
-        # Mocking PR and maintainer data
-        os.environ["STAGED_RECIPES_PR_NUMBER"] = "1"  # Example PR number
-        maintainers = ["pelson", "isuruf"]
-
-        try:
-            # Running the linter function
-            lints, _ = linter.lintify_meta_yaml(
-                {"extra": {"recipe-maintainers": maintainers}},
-                recipe_dir="python",
-                conda_forge=True,
-            )
-
-            # Expected message if a maintainer has not participated
-            expected_message = (
-                "The following maintainers have not yet confirmed that they are willing to be listed here: "
-                "isuruf. Please ask them to comment on this PR if they are."
-            )
-            self.assertIn(expected_message, lints)
-
-            expected_message = (
-                "The following maintainers have not yet confirmed that they are willing to be listed here: "
-                "pelson, isuruf. Please ask them to comment on this PR if they are."
-            )
-            self.assertNotIn(expected_message, lints)
-        finally:
-            del os.environ["STAGED_RECIPES_PR_NUMBER"]
+        lints, _ = linter.lintify_meta_yaml(
+            {"extra": {"recipe-maintainers": ["conda-forge/core"]}},
+            conda_forge=True,
+        )
+        expected_message = (
+            'Recipe maintainer team "conda-forge/Core" does not exist'
+        )
+        self.assertNotIn(expected_message, lints)
 
     def test_bad_subheader(self):
         expected_message = (
@@ -1998,17 +1945,17 @@ noarch_platforms:
         lints, hints = linter.lintify_meta_yaml(meta)
         assert any(lint.startswith(expected_message) for lint in lints)
 
-    def test_rattler_version(self):
+    def test_recipe_v1_version(self):
         meta = {"package": {"name": "python", "version": "3.6.4"}}
         expected_message = "Package version 3.6.4 doesn't match conda spec"
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         self.assertNotIn(expected_message, lints)
 
         meta = {"package": {"name": "python", "version": "2.0.0~alpha0"}}
         expected_message = (
             "Package version 2.0.0~alpha0 doesn't match conda spec"
         )
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         assert any(lint.startswith(expected_message) for lint in lints)
 
         # when having multiple outputs it should use recipe keyword
@@ -2016,16 +1963,27 @@ noarch_platforms:
         expected_message = (
             "Package version 2.0.0~alpha0 doesn't match conda spec"
         )
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         assert any(lint.startswith(expected_message) for lint in lints)
 
-    def test_rattler_version_with_context(self):
+        meta = {"package": {"name": "python"}}
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
+        expected_message = "Package version is missing."
+        assert any(lint.startswith(expected_message) for lint in lints)
+
+        # should handle integer versions
+        meta = {"package": {"name": "python", "version": 2}}
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
+        expected_message = "Package version 2 doesn't match conda spec"
+        self.assertNotIn(expected_message, lints)
+
+    def test_recipe_v1_version_with_context(self):
         meta = {
             "context": {"foo": "3.6.4"},
             "package": {"name": "python", "version": "${{ foo }}"},
         }
         expected_message = "Package version 3.6.4 doesn't match conda spec"
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         self.assertNotIn(expected_message, lints)
 
         meta = {
@@ -2035,27 +1993,16 @@ noarch_platforms:
         expected_message = (
             "Package version 2.0.0~alpha0 doesn't match conda spec"
         )
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         assert any(lint.startswith(expected_message) for lint in lints)
 
-    @unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
-    def test_examples(self):
-        msg = (
-            "Please move the recipe out of the example dir and into its "
-            "own dir."
-        )
-        lints, hints = linter.lintify_meta_yaml(
-            {"extra": {"recipe-maintainers": ["support"]}},
-            recipe_dir="recipes/example/",
-            conda_forge=True,
-        )
-        self.assertIn(msg, lints)
-        lints = linter.lintify_meta_yaml(
-            {"extra": {"recipe-maintainers": ["support"]}},
-            recipe_dir="python",
-            conda_forge=True,
-        )
-        self.assertNotIn(msg, lints)
+        meta = {
+            "context": {"foo": 2},
+            "package": {"name": "python", "version": "${{ foo }}"},
+        }
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
+        expected_message = "Package version 2 doesn't match conda spec"
+        self.assertNotIn(expected_message, lints)
 
     def test_multiple_sources(self):
         lints = linter.main(
@@ -2108,7 +2055,7 @@ noarch_platforms:
         ]
         self.assertEqual(expected_messages, filtered_lints)
 
-    def test_rattler_single_space_pins(self):
+    def test_recipe_v1_single_space_pins(self):
         meta = {
             "requirements": {
                 "build": ["${{ compiler('c') }}", "python >=3", "pip   19"],
@@ -2116,7 +2063,7 @@ noarch_platforms:
                 "run": ["xonsh>1.0", "conda= 4.*", "conda-smithy<=54.*"],
             }
         }
-        lints, hints = linter.lintify_meta_yaml(meta, is_rattler_build=True)
+        lints, hints = linter.lintify_meta_yaml(meta, recipe_version=1)
         filtered_lints = [
             lint for lint in lints if lint.startswith("``requirements: ")
         ]
@@ -2220,7 +2167,6 @@ noarch_platforms:
         )
         assert len(hints) < 100
 
-    @unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
     def test_mpl_base_hint(self):
         meta = {
             "requirements": {
@@ -2231,7 +2177,6 @@ noarch_platforms:
         expected = "Recipes should usually depend on `matplotlib-base`"
         self.assertTrue(any(hint.startswith(expected) for hint in hints))
 
-    @unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
     def test_mpl_base_hint_outputs(self):
         meta = {
             "outputs": [
@@ -2247,12 +2192,12 @@ noarch_platforms:
         self.assertTrue(any(hint.startswith(expected) for hint in hints))
 
 
-@pytest.mark.parametrize("is_rattler_build", [True, False])
-def test_rust_license_bundling(is_rattler_build: bool):
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_rust_license_bundling(recipe_version: int):
     # Case where go-licenses is missing
     compiler = (
         "${{ compiler('rust') }}"
-        if is_rattler_build
+        if recipe_version == 1
         else "{{ compiler('rust') }}"
     )
     meta_missing_license = {
@@ -2260,7 +2205,7 @@ def test_rust_license_bundling(is_rattler_build: bool):
     }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta_missing_license, is_rattler_build=is_rattler_build
+        meta_missing_license, recipe_version=recipe_version
     )
     expected_msg = (
         "Rust packages must include the licenses of the Rust dependencies. "
@@ -2274,23 +2219,25 @@ def test_rust_license_bundling(is_rattler_build: bool):
     }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta_with_license, is_rattler_build=is_rattler_build
+        meta_with_license, recipe_version=recipe_version
     )
     assert expected_msg not in lints
 
 
-@pytest.mark.parametrize("is_rattler_build", [True, False])
-def test_go_license_bundling(is_rattler_build: bool):
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_go_license_bundling(recipe_version: int):
     # Case where go-licenses is missing
     compiler = (
-        "${{ compiler('go') }}" if is_rattler_build else "{{ compiler('go') }}"
+        "${{ compiler('go') }}"
+        if recipe_version == 1
+        else "{{ compiler('go') }}"
     )
     meta_missing_license = {
         "requirements": {"build": [compiler]},
     }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta_missing_license, is_rattler_build=is_rattler_build
+        meta_missing_license, recipe_version=recipe_version
     )
     expected_msg = (
         "Go packages must include the licenses of the Go dependencies. "
@@ -2304,7 +2251,7 @@ def test_go_license_bundling(is_rattler_build: bool):
     }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta_with_license, is_rattler_build=is_rattler_build
+        meta_with_license, recipe_version=recipe_version
     )
     assert expected_msg not in lints
 
@@ -2463,7 +2410,6 @@ class TestCliRecipeLint(unittest.TestCase):
             assert_jinja('{% set version= "0.27.3"%}', is_good=False)
 
 
-@unittest.skipUnless(is_gh_token_set(), "GH_TOKEN not set")
 def test_lint_no_builds():
     expected_message = "The feedstock has no `.ci_support` files and "
 
@@ -2492,6 +2438,88 @@ def test_lint_no_builds():
         assert not any(lint.startswith(expected_message) for lint in lints)
 
 
+def test_lint_duplicate_cfyml():
+    expected_message = (
+        "The ``conda-forge.yml`` file is not allowed to have duplicate keys."
+    )
+
+    with tmp_directory() as feedstock_dir:
+        cfyml = os.path.join(feedstock_dir, "conda-forge.yml")
+        recipe_dir = os.path.join(feedstock_dir, "recipe")
+        os.makedirs(recipe_dir, exist_ok=True)
+        with open(os.path.join(recipe_dir, "meta.yaml"), "w") as fh:
+            fh.write(
+                """
+                package:
+                   name: foo
+                """
+            )
+
+        with open(cfyml, "w") as fh:
+            fh.write(
+                textwrap.dedent(
+                    """
+                    blah: 1
+                    blah: 2
+                    """
+                )
+            )
+
+        lints = linter.main(recipe_dir, conda_forge=True)
+        assert any(lint.startswith(expected_message) for lint in lints)
+
+        with open(cfyml, "w") as fh:
+            fh.write(
+                textwrap.dedent(
+                    """
+                    blah: 1
+                    """
+                )
+            )
+
+        lints = linter.main(recipe_dir, conda_forge=True)
+        assert not any(lint.startswith(expected_message) for lint in lints)
+
+
+@pytest.mark.parametrize(
+    "yaml_block,expected_message",
+    [
+        pytest.param(
+            """
+            {% set name = "libconeangle" %}
+            {% set version = "0.1.1" %}
+
+            package:
+              name: {{ name|lower }}
+              version: {{ version }}
+
+            source:
+              url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/libconeangle-{{ version }}.tar.gz  # [unix]
+              sha256: bc828be92fdf2d2d353b5e8bb95644068220d92809276312ff2d7bca0aa8b2d1  # [unix]
+              url: https://pypi.org/packages/cp{{ CONDA_PY }}/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}-cp{{ CONDA_PY }}-cp{{ CONDA_PY }}-win_amd64.whl  # [win]
+              sha256: 467a444ca9a46675b12d43b00462052dc00a16bc322944df8053b1573a492dce  # [win and py==38]
+              sha256: b35c0643c9f1dd1c933c0a6d91b7368c32a3255e76594dea27d918b71c1166ed  # [win and py==39]
+              sha256: a32e28b3e321bdb802f28a5f04d1df65071ab42eef06a6dc15ed656780c0361e  # [win and py==310]
+            build:
+              skip: true  # [py<38 or python_impl == 'pypy' or (win and py==311)]
+              script: {{ PYTHON }} -m pip install . -vv  # [unix]
+              script_env:  # [osx and arm64]
+                - SKBUILD_CONFIGURE_OPTIONS=-DWITH_CBOOL_EXITCODE=0 -DWITH_CBOOL_EXITCODE__TRYRUN_OUTPUT='' -Df03real128_EXITCODE=1 -Df03real128_EXITCODE__TRYRUN_OUTPUT='' -Df18errorstop_EXITCODE=1 -Df18errorstop_EXITCODE__TRYRUN_OUTPUT=''  # [osx and arm64]
+              script: {{ PYTHON }} -m pip install {{ name }}-{{ version }}-cp{{ CONDA_PY }}-cp{{ CONDA_PY }}-win_amd64.whl -vv  # [win]
+              number: 3
+            """,
+            "PyPI default URL is now pypi.org",
+            id="pypi.io",
+        )
+    ],
+)
+def test_hint_recipe(tmp_path, yaml_block: str, expected_message: str):
+    (tmp_path / "meta.yaml").write_text(yaml_block)
+
+    _, hints = linter.main(tmp_path, conda_forge=False, return_hints=True)
+    assert any(list(expected_message in hint for hint in hints))
+
+
 @pytest.mark.parametrize(
     "yaml_block,annotation",
     [
@@ -2505,7 +2533,7 @@ def test_lint_no_builds():
               version: {{ version }}
 
             source:
-              url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/libconeangle-{{ version }}.tar.gz  # [unix]
+              url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/libconeangle-{{ version }}.tar.gz  # [unix]
               sha256: bc828be92fdf2d2d353b5e8bb95644068220d92809276312ff2d7bca0aa8b2d1  # [unix]
               url: https://pypi.org/packages/cp{{ CONDA_PY }}/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}-cp{{ CONDA_PY }}-cp{{ CONDA_PY }}-win_amd64.whl  # [win]
               sha256: 467a444ca9a46675b12d43b00462052dc00a16bc322944df8053b1573a492dce  # [win and py==38]
@@ -2538,7 +2566,7 @@ def test_lint_no_builds():
             - url: https://pypi.org/packages/{{ python_tag }}/{{ name[0] }}/{{ name }}/{{ name | replace('-', '_') }}-{{ version }}-{{ python_tag }}-none-any.whl
               sha256: "ec5ca1a55aefdd76d28fcc0b135251d156c7106fa979686a4b48d62b761b4732"
             {% else %}
-            - url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+            - url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
               sha256: ""
             {% endif %}
 
@@ -2590,15 +2618,15 @@ def test_lint_wheels(tmp_path, yaml_block, annotation):
         assert any(expected_message in hint for hint in hints)
 
 
-@pytest.mark.parametrize("is_rattler_build", [False, True])
-def test_pin_compatible_in_run_exports(is_rattler_build: bool):
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_pin_compatible_in_run_exports(recipe_version: int):
     meta = {
         "package": {
             "name": "apackage",
         }
     }
 
-    if is_rattler_build:
+    if recipe_version == 1:
         meta["requirements"] = {
             "run_exports": ['${{ pin_compatible("apackage") }}'],
         }
@@ -2608,15 +2636,15 @@ def test_pin_compatible_in_run_exports(is_rattler_build: bool):
         }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta, is_rattler_build=is_rattler_build
+        meta, recipe_version=recipe_version
     )
     expected = "pin_subpackage should be used instead"
     assert any(lint.startswith(expected) for lint in lints)
 
 
-@pytest.mark.parametrize("is_rattler_build", [False, True])
-def test_pin_compatible_in_run_exports_output(is_rattler_build: bool):
-    if is_rattler_build:
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_pin_compatible_in_run_exports_output(recipe_version: int):
+    if recipe_version == 1:
         meta = {
             "recipe": {
                 "name": "apackage",
@@ -2648,10 +2676,919 @@ def test_pin_compatible_in_run_exports_output(is_rattler_build: bool):
         }
 
     lints, hints = linter.lintify_meta_yaml(
-        meta, is_rattler_build=is_rattler_build
+        meta, recipe_version=recipe_version
     )
     expected = "pin_compatible should be used instead"
     assert any(lint.startswith(expected) for lint in lints)
+
+
+def test_v1_recipes():
+    with get_recipe_in_dir("v1_recipes/recipe-no-lint.yaml") as recipe_dir:
+        lints, hints = linter.main(str(recipe_dir), return_hints=True)
+        assert not lints
+
+
+def test_v1_recipes_ignore_run_exports():
+    with get_recipe_in_dir(
+        "v1_recipes/recipe-ignore_run_exports-no-lint.yaml"
+    ) as recipe_dir:
+        lints, hints = linter.main(str(recipe_dir), return_hints=True)
+        assert not lints
+
+
+def test_v1_no_test():
+    with get_recipe_in_dir("v1_recipes/recipe-no-tests.yaml") as recipe_dir:
+        lints, hints = linter.main(str(recipe_dir), return_hints=True)
+        assert "The recipe must have some tests." in lints
+
+
+def test_v1_package_name_version():
+    with get_recipe_in_dir(
+        "v1_recipes/recipe-lint-name-version.yaml"
+    ) as recipe_dir:
+        lints, hints = linter.main(str(recipe_dir), return_hints=True)
+        lint_1 = "Recipe name has invalid characters. only lowercase alpha, numeric, underscores, hyphens and dots allowed"
+        lint_2 = "Package version $!@# doesn't match conda spec: Invalid version '$!@#': invalid character(s)"
+        assert lint_1 in lints
+        assert lint_2 in lints
+
+
+@pytest.mark.parametrize("remove_top_level", [True, False])
+@pytest.mark.parametrize(
+    "outputs_to_add, outputs_expected_hints",
+    [
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    run:
+                      - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    host:
+                      - pip
+                    run:
+                      - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python-output`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    build:
+                      - pip
+                    run:
+                      - python
+                - name: python-output2
+                  requirements:
+                    run:
+                      - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python-output`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    build:
+                      - blah
+                    host:
+                      - pip
+                    run:
+                      - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python-output`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    host:
+                      - pip
+                      - @@backend@@
+                    run:
+                      - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    build:
+                      - pip
+                      - @@backend@@
+                    run:
+                      - python
+                - name: python-output2
+                  requirements:
+                    host:
+                      - pip
+                    run:
+                      - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python-output2`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    build:
+                      - pip
+                    run:
+                      - python
+                - name: python-output2
+                  requirements:
+                    host:
+                      - pip
+                    run:
+                      - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python-output2`",
+                "No valid build backend found for Python recipe for package `python-output`",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                - name: python-output
+                  requirements:
+                    build:
+                      - pip
+                      - setuptools
+                    run:
+                      - python
+                - name: python-output2
+                  requirements:
+                    host:
+                      - pip
+                      - @@backend@@
+                    run:
+                      - python
+                """
+            ),
+            [],
+        ),
+    ],
+)
+@pytest.mark.parametrize("backend", VALID_PYTHON_BUILD_BACKENDS)
+@pytest.mark.parametrize(
+    "meta_str,expected_hints",
+    [
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  run:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  host:
+                    - pip
+                  run:
+                    - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  build:
+                    - blah
+                  host:
+                    - pip
+                  run:
+                    - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python`"
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  host:
+                    - pip
+                    - @@backend@@
+                  run:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  build:
+                    - blah
+                  host:
+                    - pip
+                    - @@backend@@
+                  run:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  build:
+                    - pip
+                  run:
+                    - python
+                """
+            ),
+            [
+                "No valid build backend found for Python recipe for package `python`"
+            ],
+        ),
+    ],
+)
+def test_hint_pip_no_build_backend(
+    meta_str,
+    expected_hints,
+    backend,
+    outputs_to_add,
+    outputs_expected_hints,
+    remove_top_level,
+):
+    meta = get_yaml().load(meta_str.replace("@@backend@@", backend))
+    if remove_top_level:
+        meta.pop("requirements", None)
+        # we expect no hints in this case
+        _expected_hints = []
+    else:
+        _expected_hints = expected_hints
+
+    if outputs_to_add:
+        meta["outputs"] = get_yaml().load(
+            outputs_to_add.replace("@@backend@@", backend)
+        )
+
+    total_expected_hints = _expected_hints + outputs_expected_hints
+
+    lints = []
+    hints = []
+    linter.run_conda_forge_specific(
+        meta,
+        None,
+        lints,
+        hints,
+        recipe_version=0,
+    )
+
+    # make sure we have the expected hints
+    for expected_hint in total_expected_hints:
+        assert any(hint.startswith(expected_hint) for hint in hints), hints
+
+    # in this case we should not hint at all
+    if not total_expected_hints:
+        assert all(
+            "No valid build backend found for Python recipe for package"
+            not in hint
+            for hint in hints
+        ), hints
+
+    # it is not a lint
+    assert all(
+        "No valid build backend found for Python recipe for package"
+        not in lint
+        for lint in lints
+    ), lints
+
+
+@pytest.mark.parametrize(
+    "meta_str,expected_hints",
+    [
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  run:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  run:
+                    - python
+                """
+            ),
+            [
+                "python {{ python_min }}",
+                "python >={{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python
+                """
+            ),
+            [
+                "python {{ python_min }}",
+                "python >={{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                test:
+                  requires:
+                    - python
+                """
+            ),
+            [
+                "python {{ python_min }}",
+                "python >={{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  run:
+                    - python >={{ python_min }}
+                """
+            ),
+            [
+                "python {{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python {{ python_min }}
+                  run:
+                    - python >={{ python_min }}
+                """
+            ),
+            [
+                "python {{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python {{ python_min }}
+                  run:
+                    - python >={{ python_min }}
+
+                test:
+                  requires:
+                    - python {{ python_min }}
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python {{ python_min }}
+                  run:
+                    - python
+
+                test:
+                  requires:
+                    - python {{ python_min }}
+                """
+            ),
+            ["python >={{ python_min }}"],
+        ),
+        (
+            textwrap.dedent(
+                """
+                {% set python_min = '3.7' %}
+
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python {{ python_min }}
+                  run:
+                    - python >={{ python_min }}
+
+                test:
+                  requires:
+                    - python {{ python_min }}
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                {% set python_min = '3.7' %}
+
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python  {{ python_min }}
+                  run:
+                    - python  >={{ python_min }}
+
+                test:
+                  requires:
+                    - python    {{ python_min }}
+                """
+            ),
+            [],
+        ),
+    ],
+)
+def test_hint_noarch_python_use_python_min(
+    meta_str,
+    expected_hints,
+):
+    meta = get_yaml().load(render_meta_yaml(meta_str))
+    lints = []
+    hints = []
+    linter.run_conda_forge_specific(
+        meta,
+        None,
+        lints,
+        hints,
+        recipe_version=0,
+    )
+
+    # make sure we have the expected hints
+    if expected_hints:
+        for expected_hint in expected_hints:
+            assert any(expected_hint in hint for hint in hints), hints
+    else:
+        assert all(
+            "noarch: python recipes should almost always follow the syntax in"
+            not in hint
+            for hint in hints
+        )
+
+
+@pytest.mark.parametrize(
+    "meta_str,expected_hints",
+    [
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                requirements:
+                  run:
+                    - python
+                """
+            ),
+            [],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  run:
+                    - python
+                """
+            ),
+            [
+                "python ${{ python_min }}",
+                "python >=${{ python_min }}",
+            ],
+        ),
+        (
+            textwrap.dedent(
+                """
+                package:
+                  name: python
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python ${{ python_min }}
+                  run:
+                    - python >=${{ python_min }}
+
+                tests:
+                  - requirements:
+                      run:
+                        - python ${{ python_min }}
+                """
+            ),
+            [],
+        ),
+    ],
+)
+def test_hint_noarch_python_use_python_min_v1(
+    meta_str,
+    expected_hints,
+):
+    meta = get_yaml().load(meta_str)
+    lints = []
+    hints = []
+    linter.run_conda_forge_specific(
+        meta,
+        None,
+        lints,
+        hints,
+        recipe_version=1,
+    )
+
+    # make sure we have the expected hints
+    if expected_hints:
+        for expected_hint in expected_hints:
+            assert any(expected_hint in hint for hint in hints), hints
+    else:
+        assert all(
+            "noarch: python recipes should almost always follow the syntax in"
+            not in hint
+            for hint in hints
+        )
+
+
+def test_lint_recipe_parses_ok():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "meta.yaml"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    package:
+                      name: foo
+
+                    build:
+                      number: 0
+
+                    test:
+                      imports:
+                        - foo
+
+                    about:
+                      home: something
+                      license: MIT
+                      license_file: LICENSE
+                      summary: a test recipe
+
+                    extra:
+                      recipe-maintainers:
+                        - a
+                        - b
+                    """
+                )
+            )
+        lints, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        assert not any(
+            lint.startswith(
+                "The recipe is not parsable by any of the known recipe parsers"
+            )
+            for lint in lints
+        ), lints
+        assert not any(
+            hint.startswith("The recipe is not parsable by parser")
+            for hint in hints
+        ), hints
+
+
+def test_lint_recipe_parses_forblock():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # CRM cannot parse this one
+        with open(os.path.join(tmpdir, "meta.yaml"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    package:
+                      name: foo
+                    build:
+                      number: 0
+                    test:
+                      imports:
+                        {% for blah in blahs %}
+                        - {{ blah }}
+                        {% endfor %}
+                    about:
+                      home: something
+                      license: MIT
+                      license_file: LICENSE
+                      summary: a test recipe
+                    extra:
+                      recipe-maintainers:
+                          - a
+                          - b
+                    """
+                )
+            )
+        lints, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        assert not any(
+            lint.startswith(
+                "The recipe is not parsable by any of the known recipe parsers"
+            )
+            for lint in lints
+        ), lints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-forge-tick"
+            )
+            for hint in hints
+        ), hints
+        assert any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-recipe-manager"
+            )
+            for hint in hints
+        ), hints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-souschef"
+            )
+            for hint in hints
+        ), hints
+
+
+def test_lint_recipe_parses_spacing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # CRM fails if the yaml has differing spacing
+        with open(os.path.join(tmpdir, "meta.yaml"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    package:
+                      name: foo
+                    build:
+                      number: 0
+                    test:
+                      imports:
+                          - foo
+                    about:
+                      home: something
+                      license: MIT
+                      license_file: LICENSE
+                      summary: a test recipe
+                    extra:
+                      recipe-maintainers:
+                          - a
+                          - b
+                    """
+                )
+            )
+        lints, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        assert not any(
+            lint.startswith(
+                "The recipe is not parsable by any of the known recipe parsers"
+            )
+            for lint in lints
+        ), lints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-forge-tick"
+            )
+            for hint in hints
+        ), hints
+        assert any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-recipe-manager"
+            )
+            for hint in hints
+        ), hints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-souschef"
+            )
+            for hint in hints
+        ), hints
+
+
+def test_lint_recipe_parses_v1_spacing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "recipe.yaml"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    package:
+                      name: blah
+
+                    build:
+                        number: ${{ build }}
+
+                    about:
+                      home: something
+                      license: MIT
+                      license_file: LICENSE
+                      summary: a test recipe
+
+                    extra:
+                      recipe-maintainers:
+                        - a
+                        - b
+                    """
+                )
+            )
+        lints, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        assert not any(
+            lint.startswith(
+                "The recipe is not parsable by any of the known recipe parsers"
+            )
+            for lint in lints
+        ), lints
+        assert any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-recipe-manager"
+            )
+            for hint in hints
+        ), hints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `ruamel.yaml"
+            )
+            for hint in hints
+        ), hints
+
+
+def test_lint_recipe_parses_v1_duplicate_keys():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "recipe.yaml"), "w") as f:
+            f.write(
+                textwrap.dedent(
+                    """
+                    package:
+                      name: blah
+
+                    build:
+                      number: ${{ build }}
+                      number: 42
+
+                    about:
+                      home: something
+                      license: MIT
+                      license_file: LICENSE
+                      summary: a test recipe
+
+                    extra:
+                      recipe-maintainers:
+                        - a
+                        - b
+                    """
+                )
+            )
+        lints, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        assert not any(
+            lint.startswith(
+                "The recipe is not parsable by any of the known recipe parsers"
+            )
+            for lint in lints
+        ), lints
+        assert not any(
+            hint.startswith(
+                "The recipe is not parsable by parser `conda-recipe-manager"
+            )
+            for hint in hints
+        ), hints
+        assert any(
+            hint.startswith(
+                "The recipe is not parsable by parser `ruamel.yaml"
+            )
+            for hint in hints
+        ), hints
 
 
 if __name__ == "__main__":

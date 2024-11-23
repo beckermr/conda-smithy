@@ -1,16 +1,25 @@
 import copy
 import os
 import re
+import sys
+import time
 from collections.abc import Sequence
+from functools import lru_cache
 from glob import glob
 from typing import Dict, List, Mapping, Optional, Union
 
+import requests
 from conda.models.version import InvalidVersionSpec, VersionOrder
 from conda_build.metadata import (
     FIELDS as _CONDA_BUILD_FIELDS,
 )
 from rattler_build_conda_compat import loader as rattler_loader
-from rattler_build_conda_compat.recipe_sources import get_all_url_sources
+from rattler_build_conda_compat.recipe_sources import get_all_sources
+
+if sys.version_info[:2] < (3, 11):
+    import tomli as tomllib
+else:
+    import tomllib
 
 FIELDS = copy.deepcopy(_CONDA_BUILD_FIELDS)
 
@@ -46,12 +55,29 @@ JINJA_VAR_PAT = re.compile(r"{{(.*?)}}")
 CONDA_BUILD_TOOL = "conda-build"
 RATTLER_BUILD_TOOL = "rattler-build"
 
+VALID_PYTHON_BUILD_BACKENDS = [
+    "setuptools",
+    "flit-core",
+    "hatchling",
+    "poetry-core",
+    "pdm-backend",
+    "pdm-pep517",
+    "pymsbuild",
+    "meson-python",
+    "scikit-build-core",
+    "maturin",
+    "jupyter_packaging",
+    "whey",
+]
 
-def get_section(parent, name, lints, is_rattler_build=False):
-    if not is_rattler_build:
+
+def get_section(parent, name, lints, recipe_version: int = 0):
+    if recipe_version == 0:
         return get_meta_section(parent, name, lints)
+    elif recipe_version == 1:
+        return get_recipe_v1_section(parent, name)
     else:
-        return get_rattler_section(parent, name)
+        raise ValueError(f"Unknown recipe version: {recipe_version}")
 
 
 def get_meta_section(parent, name, lints):
@@ -70,13 +96,13 @@ def get_meta_section(parent, name, lints):
     return section
 
 
-def get_rattler_section(meta, name) -> Union[Dict, List[Dict], List[str]]:
+def get_recipe_v1_section(meta, name) -> Union[Dict, List[Dict]]:
     if name == "requirements":
         return rattler_loader.load_all_requirements(meta)
     elif name == "tests":
         return rattler_loader.load_all_tests(meta)
     elif name == "source":
-        sources = get_all_url_sources(meta)
+        sources = get_all_sources(meta)
         return list(sources)
 
     return meta.get(name, {})
@@ -183,3 +209,22 @@ def _lint_package_version(version: Optional[str]) -> Optional[str]:
         VersionOrder(ver)
     except InvalidVersionSpec as e:
         return invalid_version.format(ver=ver, err=e)
+
+
+def load_linter_toml_metdata():
+    # ensure we refresh the cache every hour
+    ttl = 3600
+    time_salt = int(time.time() / ttl)
+    return load_linter_toml_metdata_internal(time_salt)
+
+
+@lru_cache(maxsize=1)
+def load_linter_toml_metdata_internal(time_salt):
+    hints_toml_url = "https://raw.githubusercontent.com/conda-forge/conda-forge-pinning-feedstock/main/recipe/linter_hints/hints.toml"
+    hints_toml_req = requests.get(hints_toml_url)
+    if hints_toml_req.status_code != 200:
+        # too bad, but not important enough to throw an error;
+        # linter will rerun on the next commit anyway
+        return None
+    hints_toml_str = hints_toml_req.content.decode("utf-8")
+    return tomllib.loads(hints_toml_str)

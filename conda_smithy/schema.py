@@ -91,6 +91,10 @@ class BotConfigVersionUpdatesSourcesChoice(StrEnum):
     ROS_DISTRO = "rosdistro"
 
 
+class Lints(StrEnum):
+    LINT_NOARCH_SELECTORS = "lint_noarch_selectors"
+
+
 ##############################################
 ########## Model definitions #################
 ##############################################
@@ -118,6 +122,11 @@ class AzureRunnerSettings(BaseModel):
 
     variables: Optional[Dict[str, str]] = Field(
         default_factory=dict, description="Variables"
+    )
+
+    # windows only
+    install_atl: Optional[bool] = Field(
+        default=False, description="Whether to install ATL components for MSVC"
     )
 
 
@@ -198,20 +207,40 @@ class AzureConfig(BaseModel):
 
     settings_osx: AzureRunnerSettings = Field(
         default_factory=lambda: AzureRunnerSettings(
-            pool={"vmImage": "macOS-12"}
+            pool={"vmImage": "macOS-13"}
         ),
         description="OSX-specific settings for runners",
     )
 
     settings_win: AzureRunnerSettings = Field(
         default_factory=lambda: AzureRunnerSettings(
+            install_atl=False,
             pool={"vmImage": "windows-2022"},
             variables={
+                "MINIFORGE_HOME": "D:\\Miniforge",
                 "CONDA_BLD_PATH": "D:\\\\bld\\\\",
                 "UPLOAD_TEMP": "D:\\\\tmp",
             },
         ),
-        description="Windows-specific settings for runners",
+        description=cleandoc(
+            """
+            Windows-specific settings for runners. Aside from overriding the `vmImage`,
+            you can also specify `install_atl: true` in case you need the ATL components
+            for MSVC; these don't get installed by default anymore, see
+            https://github.com/actions/runner-images/issues/9873
+
+            Finally, under `variables`, some important things you can set are:
+
+            - `CONDA_BLD_PATH`: Location of the conda-build workspace. Defaults to `D:\\bld`
+            - `MINIFORGE_HOME`: Location of the base environment installation. Defaults to
+              `D:\\Miniforge`.
+            - `SET_PAGEFILE`: `"True"` to increase the pagefile size via conda-forge-ci-setup.
+
+            If you are running out of space in `D:`, consider changing to `C:`.
+            It's a slower drive but has more space available. We recommend you keep
+            both `CONDA_BLD_PATH` and `MINIFORGE_HOME` in the same drive for performance.
+            """
+        ),
     )
 
     user_or_org: Optional[Union[str, Nullable]] = Field(
@@ -446,6 +475,14 @@ class CondaBuildConfig(BaseModel):
     )
 
 
+class LinterConfig(BaseModel):
+
+    skip: Optional[List[Lints]] = Field(
+        default_factory=list,
+        description="List of lints to skip",
+    )
+
+
 class CondaForgeDocker(BaseModel):
     model_config: ConfigDict = ConfigDict(extra="forbid")
 
@@ -575,6 +612,22 @@ class ConfigModel(BaseModel):
         ),
     )
 
+    linter: Optional[LinterConfig] = Field(
+        default_factory=LinterConfig,
+        description=cleandoc(
+            """
+        Settings in this block are used to control how `conda smithy` lints
+        An example of the such configuration is:
+
+        ```yaml
+        linter:
+            skip:
+                - lint_noarch_selectors
+        ```
+        """
+        ),
+    )
+
     conda_build_tool: Optional[conda_build_tools] = Field(
         default="conda-build",
         description=cleandoc(
@@ -584,13 +637,20 @@ class ConfigModel(BaseModel):
         ),
     )
 
-    conda_install_tool: Optional[Literal["conda", "mamba"]] = Field(
-        default="mamba",
+    conda_install_tool: Optional[
+        Literal["conda", "mamba", "micromamba", "pixi"]
+    ] = Field(
+        default="micromamba",
         description=cleandoc(
             """
-        Use this option to choose which tool is used to provision the tooling in your
-        feedstock.
-        """
+                Use this option to choose which tool is used to provision the tooling in your
+                feedstock. Defaults to micromamba.
+
+                If conda or mamba are chosen, the latest Miniforge will be used to
+                provision the base environment. If micromamba or pixi are chosen,
+                Miniforge is not involved; the environment is created directly by
+                micromamba or pixi.
+                """
         ),
     )
 
@@ -1209,14 +1269,14 @@ class ConfigModel(BaseModel):
         ```yaml
         azure:
             settings_linux:
-            pool:
-                name: your_local_pool_name
-                demands:
-                  - some_key -equals some_value
-            workspace:
-                clean: all
-            strategy:
-                maxParallel: 1
+                pool:
+                    name: your_local_pool_name
+                    demands:
+                        - some_key -equals some_value
+                workspace:
+                    clean: all
+                strategy:
+                    maxParallel: 1
         ```
 
         Below is an example configuration for adding a swapfile on an Azure agent for Linux:
@@ -1225,6 +1285,16 @@ class ConfigModel(BaseModel):
         azure:
             settings_linux:
                 swapfile_size: 10GiB
+        ```
+
+        If you need more space on Windows, you can use `C:` at the cost of IO performance:
+
+        ```yaml
+        azure:
+            settings_win:
+                variables:
+                    CONDA_BLD_PATH: "C:\\bld"
+                    MINIFORGE_HOME: "C:\\Miniforge"
         ```
         """
         ),

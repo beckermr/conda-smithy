@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -13,15 +14,19 @@ import jinja2
 import jinja2.sandbox
 import ruamel.yaml
 from conda_build.api import render as conda_build_render
+from conda_build.config import Config
 from conda_build.render import MetaData
 from rattler_build_conda_compat.render import MetaData as RattlerBuildMetaData
 
 RATTLER_BUILD = "rattler-build"
 CONDA_BUILD = "conda-build"
+SET_PYTHON_MIN_RE = re.compile(r"{%\s+set\s+python_min\s+=")
 
 
 def _get_metadata_from_feedstock_dir(
-    feedstock_directory: Union[str, os.PathLike], forge_config: Dict[str, Any]
+    feedstock_directory: Union[str, os.PathLike],
+    forge_config: Dict[str, Any],
+    conda_forge_pinning_file: Union[str, os.PathLike, None] = None,
 ) -> Union[MetaData, RattlerBuildMetaData]:
     """
     Return either the conda-build metadata or rattler-build metadata from the feedstock directory
@@ -33,9 +38,15 @@ def _get_metadata_from_feedstock_dir(
             feedstock_directory,
         )
     else:
+        if conda_forge_pinning_file:
+            config = Config(
+                variant_config_files=[conda_forge_pinning_file],
+            )
+        else:
+            config = None
         meta = conda_build_render(
             feedstock_directory,
-            permit_undefined_jinja=True,
+            config=config,
             finalize=False,
             bypass_env_check=True,
             trim_skip=False,
@@ -57,7 +68,7 @@ def get_feedstock_name_from_meta(
 
 
 def get_feedstock_about_from_meta(meta) -> dict:
-    """Fetch the feedtstock about from the parsed meta.yaml."""
+    """Fetch the feedstock about from the parsed meta.yaml."""
     # it turns out that conda_build would not preserve the feedstock about:
     #   - if a subpackage does not have about, it uses the feedstock's
     #   - if a subpackage has about, it's used as is
@@ -75,14 +86,14 @@ def get_feedstock_about_from_meta(meta) -> dict:
         return dict(meta.meta["about"])
 
 
-def get_yaml():
+def get_yaml(allow_duplicate_keys: bool = True):
     # define global yaml API
     # roundrip-loader and allowing duplicate keys
     # for handling # [filter] / # [not filter]
     # Don't use a global variable for this as a global
     # variable will make conda-smithy thread unsafe.
     yaml = ruamel.yaml.YAML(typ="rt")
-    yaml.allow_duplicate_keys = True
+    yaml.allow_duplicate_keys = allow_duplicate_keys
     return yaml
 
 
@@ -118,6 +129,15 @@ def stub_subpackage_pin(*args, **kwargs):
     return f"subpackage_pin {args[0]}"
 
 
+def _munge_python_min(text):
+    new_lines = []
+    for line in text.splitlines(keepends=True):
+        if SET_PYTHON_MIN_RE.match(line):
+            line = "{% set python_min = '9999' %}\n"
+        new_lines.append(line)
+    return "".join(new_lines)
+
+
 def render_meta_yaml(text):
     env = jinja2.sandbox.SandboxedEnvironment(undefined=NullUndefined)
 
@@ -140,12 +160,13 @@ def render_meta_yaml(text):
             target_platform="linux-64",
             build_platform="linux-64",
             mpi="mpi",
+            python_min="9999",  # use as a sentinel value for linting
         )
     )
     mockos = MockOS()
     py_ver = "3.7"
     context = {"os": mockos, "environ": mockos.environ, "PY_VER": py_ver}
-    content = env.from_string(text).render(context)
+    content = env.from_string(_munge_python_min(text)).render(context)
     return content
 
 
